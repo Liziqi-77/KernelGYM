@@ -3,6 +3,7 @@ import hydra
 from verl_patch.trainer.code.fsdp_sft_trainer import create_sft_dataset, FSDPSFTTrainer
 from verl.utils.distributed import initialize_global_process_group
 from torch.distributed.device_mesh import DeviceMesh, init_device_mesh
+from verl.utils.device import get_device_name
 
 from .constant import QWEN3CHATTEMPLATE
 
@@ -12,10 +13,11 @@ from verl.utils.fs import copy_to_local
 def main(config):
     local_rank, rank, world_size = initialize_global_process_group()
 
-    device_mesh = init_device_mesh(device_type="cuda", mesh_shape=(world_size,), mesh_dim_names=("fsdp",))
+    device_type = get_device_name()
+    device_mesh = init_device_mesh(device_type=device_type, mesh_shape=(world_size,), mesh_dim_names=("fsdp",))
     dp_size = world_size // config.ulysses_sequence_parallel_size
     ulysses_device_mesh = init_device_mesh(
-        device_type="cuda", mesh_shape=(dp_size, config.ulysses_sequence_parallel_size), mesh_dim_names=("dp", "sp")
+        device_type=device_type, mesh_shape=(dp_size, config.ulysses_sequence_parallel_size), mesh_dim_names=("dp", "sp")
     )
     # build tokenizer and datasets first
     from verl.utils import hf_tokenizer

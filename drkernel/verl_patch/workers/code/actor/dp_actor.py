@@ -525,9 +525,9 @@ class CodeDataParallelPPOActor(BasePPOActor):
                 for micro_batch in micro_batches:
                     # Support all hardwares
                     if isinstance(micro_batch, DataProto):
-                        data = {**micro_batch.batch.to(torch.cuda.current_device()), **micro_batch.non_tensor_batch}
+                        data = {**micro_batch.batch.to(get_device_id()), **micro_batch.non_tensor_batch}
                     else:
-                        data = micro_batch.to(torch.cuda.current_device())  # actor device is cpu when using offload
+                        data = micro_batch.to(get_device_id())  # actor device is cpu when using offload
                     responses = data['responses']
                     response_length = responses.size(1)
                     attention_mask = data['attention_mask']

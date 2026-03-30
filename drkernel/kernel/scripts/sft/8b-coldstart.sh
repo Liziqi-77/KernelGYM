@@ -34,6 +34,15 @@ export NNODES="${NNODES:-${ARNOLD_WORKER_NUM:-1}}"
 export NODE_RANK="${NODE_RANK:-${ARNOLD_ID:-0}}"
 export MASTER_ADDR="${MASTER_ADDR:-${ARNOLD_WORKER_0_HOST:-127.0.0.1}}"
 
+# Detect device type (NPU or GPU)
+if command -v npu-smi &> /dev/null; then
+    export DEVICE_TYPE="npu"
+    echo "NPU detected, using NPU for training"
+else
+    export DEVICE_TYPE="cuda"
+    echo "GPU detected, using CUDA for training"
+fi
+
 MASTER_PORT=$(echo "${ARNOLD_WORKER_0_PORT:-29500}" | cut -d',' -f1)
 
 is_port_in_use() {
