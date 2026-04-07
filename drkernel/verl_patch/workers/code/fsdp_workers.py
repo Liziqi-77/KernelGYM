@@ -103,9 +103,11 @@ device_name = get_device_name()
 def create_device_mesh(world_size, fsdp_size):
     device_type = get_device_name()
     if fsdp_size < 0 or fsdp_size >= world_size:
+        # device_mesh = init_device_mesh('cuda', mesh_shape=(world_size,), mesh_dim_names=['fsdp'])
         device_mesh = init_device_mesh(device_type, mesh_shape=(world_size,), mesh_dim_names=['fsdp'])
     else:
         device_mesh = init_device_mesh(
+            # 'cuda', mesh_shape=(world_size // fsdp_size, fsdp_size), mesh_dim_names=['ddp', 'fsdp']
             device_type, mesh_shape=(world_size // fsdp_size, fsdp_size), mesh_dim_names=['ddp', 'fsdp']
         )
     return device_mesh
@@ -313,7 +315,9 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
 
         # override model kwargs
         actor_model_config = AutoConfig.from_pretrained(
-            local_path, trust_remote_code=trust_remote_code,             attn_implementation="eager" if is_npu_available() else "flash_attention_2"
+            local_path,
+            trust_remote_code=trust_remote_code,
+            attn_implementation="eager" if is_npu_available else "flash_attention_2"
         )
         # TODO: VL models use VisionAttention, which directly uses flash_attention in transformers>=4.53
         # which will be patched by _ulysses_flash_attention_forward, but errorly misses position_ids
@@ -760,9 +764,10 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         if self._is_offload_param:
             load_fsdp_model_to_gpu(self.actor_module_fsdp)
         if self._is_offload_optimizer:
+            # load_fsdp_optimizer(optimizer=self.actor_optimizer, device_id=torch.cuda.current_device())
             load_fsdp_optimizer(optimizer=self.actor_optimizer, device_id=get_device_id())
 
-        log_gpu_memory_usage('Before update policy', logger=logger)
+        # log_gpu_memory_usage('Before update policy', logger=logger)
 
         with self.ulysses_sharding_manager:
             data = data.to("cpu")  # data will to device with each micro batch on actor.update_policy
@@ -1125,7 +1130,7 @@ class CriticWorker(Worker):
                 pretrained_model_name_or_path=local_path,
                 torch_dtype=torch_dtype,
                 config=critic_model_config,
-                attn_implementation='eager' if is_npu_available() else 'flash_attention_2',
+                attn_implementation='eager' if is_npu_available else 'flash_attention_2',
                 trust_remote_code=trust_remote_code,
             )
 
@@ -1171,6 +1176,7 @@ class CriticWorker(Worker):
             param_init_fn=init_fn,
             use_orig_params=False,
             auto_wrap_policy=auto_wrap_policy,
+            # device_id=torch.cuda.current_device(),
             device_id=get_device_id(),
             sharding_strategy=sharding_strategy,
             mixed_precision=mixed_precision,
@@ -1238,6 +1244,7 @@ class CriticWorker(Worker):
     def compute_values(self, data: DataProto):
 
         # Support all hardwares
+        # data = data.to(torch.cuda.current_device())
         data = data.to(get_device_id())
 
         if self._is_offload_param:
@@ -1261,10 +1268,12 @@ class CriticWorker(Worker):
     @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
     def update_critic(self, data: DataProto):
         # Support all hardwares
+        # data = data.to(torch.cuda.current_device())
         data = data.to(get_device_id())
         if self._is_offload_param:
             load_fsdp_model_to_gpu(self.critic_module)
         if self._is_offload_optimizer:
+            # load_fsdp_optimizer(optimizer=self.critic_optimizer, device_id=torch.cuda.current_device())
             load_fsdp_optimizer(optimizer=self.critic_optimizer, device_id=get_device_id())
 
         # perform forward computation
@@ -1402,7 +1411,7 @@ class RewardModelWorker(Worker):
                 pretrained_model_name_or_path=local_path,
                 config=model_config,
                 torch_dtype=torch.bfloat16,
-                attn_implementation='eager' if is_npu_available() else 'flash_attention_2',
+                attn_implementation='eager' if is_npu_available else 'flash_attention_2',
                 trust_remote_code=trust_remote_code,
             )
 
@@ -1423,6 +1432,7 @@ class RewardModelWorker(Worker):
             param_init_fn=init_fn,
             use_orig_params=False,
             auto_wrap_policy=auto_wrap_policy,
+            # device_id=torch.cuda.current_device(),
             device_id=get_device_id(),
             sharding_strategy=sharding_strategy,  # zero3
             sync_module_states=True,
@@ -1451,6 +1461,7 @@ class RewardModelWorker(Worker):
             ulysses_pad_and_slice_inputs,
         )
 
+        # with torch.no_grad(), torch.autocast(device_type='cuda', dtype=torch.bfloat16):
         with torch.no_grad(), torch.autocast(device_type=get_device_name(), dtype=torch.bfloat16):
             input_ids = micro_batch['input_ids']
             batch_size, seqlen = input_ids.shape
@@ -1581,13 +1592,15 @@ class RewardModelWorker(Worker):
         from verl.utils.seqlen_balancing import get_reverse_idx, rearrange_micro_batches
 
         # Support all hardwares
+        # data = data.to(torch.cuda.current_device())
         data = data.to(get_device_id())
         if self._do_switch_chat_template:
             rm_data = self._switch_chat_template(data)
 
         # Support all hardwares
+        # rm_data.batch = rm_data.batch.to(torch.cuda.current_device())
         rm_data.batch = rm_data.batch.to(get_device_id())
-
+        
         # perform forward computation
         with self.ulysses_sharding_manager:
             rm_data = self.ulysses_sharding_manager.preprocess_data(data=rm_data)

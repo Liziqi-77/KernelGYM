@@ -1,10 +1,10 @@
+
 import random
 
 import numpy as np
 import torch
 
 from verl.utils.device import get_device_name
-
 
 def save_random_states():
     device_name = get_device_name()
@@ -14,7 +14,6 @@ def save_random_states():
         torch_device_state = torch.npu.get_rng_state_all()
     else:
         raise NotImplementedError(f"Unsupported device: {device_name}")
-    
     rng_states = {
         'torch_cpu': torch.get_rng_state(),
         'torch_device': torch_device_state,
@@ -22,7 +21,6 @@ def save_random_states():
         'numpy': np.random.get_state(),
     }
     return rng_states
-
 
 def set_global_seed(seed):
     device_name = get_device_name()
