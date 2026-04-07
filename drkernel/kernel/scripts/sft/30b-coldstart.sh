@@ -196,7 +196,7 @@ torchrun --nproc-per-node $GPUS_PER_NODE \
   --node-rank $NODE_RANK \
   --master-port $MASTER_PORT \
   --nnodes $NNODES -m kernel.fsdp_sft_trainer \
-  data.multiturn.enable=True \
+  data.multiturn.enable=False \
   data.train_files=$ACTUAL_DATA_PATH \
   data.val_files=$ACTUAL_DATA_PATH \
   data.train_batch_size=$TRAIN_BATCH_SIZE \

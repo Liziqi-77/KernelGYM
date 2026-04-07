@@ -1,5 +1,5 @@
 # Copyright 2024 Bytedance Ltd. and/or its affiliates
-#
+#bert_paddingpad_input
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
@@ -26,19 +26,24 @@ os.environ["TOKENIZERS_PARALLELISM"] = "true"
 import logging
 import re
 from contextlib import nullcontext
-
+import time  # 在原有 imports 后添加
 import hydra
 import torch
 import torch.distributed
 import verl.utils.hdfs_io as hdfs_io
-try:
-    from flash_attn.bert_padding import index_first_axis, pad_input, rearrange, unpad_input
-except ImportError:
-    # NPU or other devices may not have flash_attn
-    index_first_axis = None
-    pad_input = None
-    rearrange = None
-    unpad_input = None
+import torch_npu
+from.npu_flash_attention import index_first_axis, pad_input, rearrange, unpad_input
+# from flash_attn.bert_padding import index_first_axis, pad_input, rearrange, unpad_input
+
+# try:
+#     from flash_attn.bert_padding import index_first_axis, pad_input, rearrange, unpad_input
+# except ImportError:
+#     # NPU or other devices may not have flash_attn
+#     index_first_axis = None
+#     pad_input = None
+#     rearrange = None
+#     unpad_input = None
+
 from peft import LoraConfig, TaskType, get_peft_model
 from tensordict import TensorDict
 from torch import nn, optim
@@ -74,8 +79,18 @@ from verl.workers.sharding_manager.fsdp_ulysses import FSDPUlyssesShardingManage
 from verl_patch.trainer.code.constant import QWEN3CHATTEMPLATE, QWEN3CODERCHATTEMPLATE
 from verl_patch.utils.dataset import SFTDataset
 
-logger = logging.getLogger(__file__)
-logger.setLevel(os.getenv("VERL_SFT_LOGGING_LEVEL", "WARN"))
+# logger = logging.getLogger(__file__)
+logger = logging.getLogger("SFTTrainer")
+# logger.setLevel(os.getenv("VERL_SFT_LOGGING_LEVEL", "WARN"))
+# print(f"🔍 Logger ID: {id(logger)}")
+# print(f"🔍 Logger Level: {logger.level} ({logging.getLevelName(logger.level)})")
+# print(f"🔍 Handlers 数量: {len(logger.handlers)}")
+# for i, h in enumerate(logger.handlers):
+#     print(f"   Handler {i}: {type(h).__name__} | Level: {h.level} | {getattr(h, 'baseFilename', 'N/A')}")
+
+# # 测试写入
+# logger.info("🧪 测试写入文件")
+
 
 
 def extract_step(path):
@@ -123,8 +138,8 @@ class FSDPSFTTrainer:
         self.config.ulysses_sequence_parallel_size = getattr(self.config, "ulysses_sequence_parallel_size", 1)
         self.use_remove_padding = getattr(self.config, "use_remove_padding", False)
         if self.device_mesh.get_rank() == 0:
-            print(f"Using sequence parallel size: {self.config.ulysses_sequence_parallel_size}")
-            print(f"Using remove padding: {self.use_remove_padding}")
+            logger.info(f"Using sequence parallel size: {self.config.ulysses_sequence_parallel_size}")
+            logger.info(f"Using remove padding: {self.use_remove_padding}")
 
         self._build_dataloader(train_dataset, val_dataset)
         # build model
@@ -153,7 +168,7 @@ class FSDPSFTTrainer:
         self.train_dataset, self.val_dataset = train_dataset, val_dataset
 
         # build dataloader
-        # Use data parallel rank and size instead of global rank and world size
+        # Use data parallel rank and size instead of global rank and world size_build_model_optimizer 
 
         # If doing SP, we need to use the local rank and size
         if self.config.ulysses_sequence_parallel_size > 1:
@@ -204,8 +219,7 @@ class FSDPSFTTrainer:
 
             importlib.import_module(self.config.model.external_lib)
 
-        if get_device_name() == "cuda":
-            log_gpu_memory_usage("Before model allocation", logger=logger)
+        # log_gpu_memory_usage("Before model allocation", logger=logger)
 
         trust_remote_code = self.config.model.trust_remote_code
         # load config first
@@ -219,11 +233,12 @@ class FSDPSFTTrainer:
         )
 
         with init_context():
-            attn_impl = "eager" if is_npu_available() else "flash_attention_2"
+            attn_impl = "eager" if is_npu_available else "flash_attention_2"
             self.model: PreTrainedModel = AutoModelForCausalLM.from_pretrained(
                 local_model_path,
                 config=config,
                 torch_dtype=torch.float32,
+                # attn_implementation="flash_attention_2",
                 attn_implementation=attn_impl,
                 trust_remote_code=trust_remote_code,
             )
@@ -256,6 +271,7 @@ class FSDPSFTTrainer:
         if self.config.model.enable_gradient_checkpointing:
             self.model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
 
+        # log_gpu_memory_usage("After model allocation", logger=logger)
         if get_device_name() == "cuda":
             log_gpu_memory_usage("After model allocation", logger=logger)
 
@@ -284,11 +300,16 @@ class FSDPSFTTrainer:
             mixed_precision=mixed_precision,
             device_mesh=self.device_mesh,
             sync_module_states=True,
+            # device_id=torch.cuda.current_device(),
             device_id=get_device_id(),
             cpu_offload=cpu_offload,
             use_orig_params=False,
         )
 
+        if self.device_mesh.get_rank() == 0:
+            logger.info("✅ FSDP 包装完成")
+
+        # log_gpu_memory_usage("After FSDP wrapping", logger=logger)
         if get_device_name() == "cuda":
             log_gpu_memory_usage("After FSDP wrapping", logger=logger)
 
@@ -298,12 +319,16 @@ class FSDPSFTTrainer:
             betas=self.config.optim.betas,
             weight_decay=self.config.optim.weight_decay,
         )
-
+        
+        # log_gpu_memory_usage("After initialize optimizer", logger=logger)
         if get_device_name() == "cuda":
             log_gpu_memory_usage("After initialize optimizer", logger=logger)
 
         self.steps_per_epoch = len(self.train_dataloader)
         self.total_steps = self.steps_per_epoch * self.config.trainer.total_epochs
+
+        if self.device_mesh.get_rank() == 0:
+            logger.info(f"✅ 优化器就绪: lr={self.config.optim.lr}, warmup_steps={int(self.total_steps * self.config.optim.warmup_steps_ratio)}")
 
         if self.device_mesh.get_rank() == 0:
             print(
@@ -328,6 +353,10 @@ class FSDPSFTTrainer:
         use_sp = self.use_remove_padding and self.config.ulysses_sequence_parallel_size > 1
 
         # Move inputs to GPU and prepare loss mask
+        # input_ids = batch["input_ids"].cuda()
+        # attention_mask = batch["attention_mask"].cuda()
+        # position_ids = batch["position_ids"].cuda()
+        # loss_mask = batch.pop("loss_mask")[:, :-1].reshape(-1).cuda()
         device = get_device_id()
         input_ids = batch["input_ids"].to(device)
         attention_mask = batch["attention_mask"].to(device)
@@ -337,6 +366,7 @@ class FSDPSFTTrainer:
 
         # Context manager for sequence parallel if needed
         context = self.sharding_manager if use_sp else nullcontext()
+        # with context, torch.autocast(device_type="cuda", dtype=torch.bfloat16):
         with context, torch.autocast(device_type=get_device_name(), dtype=torch.bfloat16):
             if not use_sp:
                 # Standard forward pass without sequence parallel
@@ -375,6 +405,8 @@ class FSDPSFTTrainer:
                 ).transpose(0, 1)
 
                 # Pad and slice inputs for sequence parallelism
+                # ulysses_pad_and_slice_inputs已适配
+                # get_ulysses_sequence_parallel_world_size已适配
                 input_ids_rmpad_sliced, position_ids_rmpad_padded, pad_size = ulysses_pad_and_slice_inputs(
                     input_ids_rmpad, position_ids_rmpad, sp_size=get_ulysses_sequence_parallel_world_size()
                 )
@@ -393,6 +425,7 @@ class FSDPSFTTrainer:
                     use_cache=False,
                 )
 
+                # logger.info(f"🔥 caculate output through fsdp_model")
                 # Compute loss locally then aggregate
                 logits_rmpad = output.logits.squeeze(0)
                 input_ids_rmpad_rolled = input_ids_rmpad_rolled.to(logits_rmpad.device)
@@ -426,22 +459,59 @@ class FSDPSFTTrainer:
     def training_step(self, batch: TensorDict):
         self.fsdp_model.train()
 
-        log_gpu_memory_usage("Before optimizer zero_grad", logger=logger)
+        # log_gpu_memory_usage("Before optimizer zero_grad", logger=logger)
+        if get_device_name() == "cuda":
+            log_gpu_memory_usage("Before optimizer zero_grad", logger=logger)
+
+        if get_device_name() == "npu":
+            torch.npu.synchronize()
+        step_start = time.time()
 
         self.optimizer.zero_grad()
 
+        # log_gpu_memory_usage("After optimizer zero_grad", logger=logger)
         if get_device_name() == "cuda":
             log_gpu_memory_usage("After optimizer zero_grad", logger=logger)
 
         micro_batches = batch.split(self.config.data.micro_batch_size_per_gpu)
         n_micro_batches = len(micro_batches)
         step_loss = 0
-        for micro_batch in micro_batches:
+        logger.info(f"✅ micro_batches 的大小为 {n_micro_batches}")
+        # for micro_batch in micro_batches:
+        #     loss = self._compute_loss_and_backward(batch=micro_batch) / n_micro_batches
+        #     step_loss += loss.item()
+        #     logger.info(f"✅ 一个 micro_batch 的 loss计算完成 step_loss为{step_loss}\n")
+
+        total_step_start = time.perf_counter()
+        step_loss = 0.0
+
+        for i, micro_batch in enumerate(micro_batches):
+            batch_start = time.perf_counter()
+            
             loss = self._compute_loss_and_backward(batch=micro_batch) / n_micro_batches
             step_loss += loss.item()
+            
+            batch_end = time.perf_counter()
+            duration = batch_end - batch_start
+            
+            # 记录单个 micro_batch 的耗时和累计 loss
+            logger.info(
+                f"✅ [Batch {i+1}/{len(micro_batches)}] loss calculation completed. "
+                f"Current step_loss: {step_loss:.4f}, Duration: {duration:.4f}s"
+            )
 
+        total_step_end = time.perf_counter()
+        total_duration = total_step_end - total_step_start
+
+        logger.info(
+            f"✅ All micro_batches completed. Total step_loss: {step_loss:.4f}, "
+            f"Total Duration: {total_duration:.4f}s, Avg per batch: {total_duration/len(micro_batches):.4f}s"
+        )
+
+        logger.info(f"✅ micro_batches 的 loss计算完成 ✅")
         grad_norm = self.fsdp_model.clip_grad_norm_(max_norm=self.config.optim.clip_grad)
 
+        # log_gpu_memory_usage("Before optimizer step", logger=logger)
         if get_device_name() == "cuda":
             log_gpu_memory_usage("Before optimizer step", logger=logger)
 
@@ -452,19 +522,38 @@ class FSDPSFTTrainer:
         else:
             self.optimizer.step()
 
+        # log_gpu_memory_usage("After optimizer step", logger=logger)
         if get_device_name() == "cuda":
             log_gpu_memory_usage("After optimizer step", logger=logger)
 
         self.lr_scheduler.step()
+        logger.info(f"✅ 学习率lr_scheduler更新完成 ✅")
 
         # reduce loss across dp ranks
         lr = self.lr_scheduler.get_last_lr()[0]
 
+        if get_device_name() == "npu":
+            torch.npu.synchronize()
+        # log_gpu_memory_usage("After offload weights", logger=logger)
         if get_device_name() == "cuda":
             log_gpu_memory_usage("After offload weights", logger=logger)
 
+        # step_loss = torch.tensor(step_loss).cuda()
         step_loss = torch.tensor(step_loss).to(get_device_id())
         torch.distributed.all_reduce(step_loss, op=torch.distributed.ReduceOp.AVG)
+        
+        logger.info(f"✅ step_loss 计算完成 ")
+
+        step_time = time.time() - step_start
+        if self.device_mesh.get_rank() == 0 and hasattr(self, '_global_step'):
+            self._global_step += 1
+            # 每10步记录一次性能
+            if self._global_step % 10 == 0:
+                logger.info(f"⏱️  Step {self._global_step} | 耗时: {step_time:.3f}s | "
+                        f"Loss: {step_loss.item():.4f} | LR: {lr*1e3:.2f}e-3")
+        elif self.device_mesh.get_rank() == 0:
+            self._global_step = 1
+
         return {"train/loss": step_loss.detach().item(), "train/lr(1e-3)": lr * 1e3}
 
     def validation_step(self, batch: TensorDict):
@@ -476,6 +565,7 @@ class FSDPSFTTrainer:
 
     def save_checkpoint(self, step):
         # save checkpoint
+        save_start = time.time()
         from torch.distributed.fsdp import FullStateDictConfig, StateDictType
 
         cfg = FullStateDictConfig(offload_to_cpu=True, rank0_only=True)
@@ -492,8 +582,55 @@ class FSDPSFTTrainer:
                 hdfs_io.makedirs(self.config.trainer.default_hdfs_dir, exist_ok=True)
                 hdfs_io.copy(src=path, dst=self.config.trainer.default_hdfs_dir, dirs_exist_ok=True)
         torch.distributed.barrier()
+        if self.device_mesh.get_rank() == 0:
+            logger.info(f"✅ 检查点保存完成 | 耗时: {time.time()-save_start:.2f}s | 路径: {path}")
+
+    def get_profiler(self):
+        # if args.profile_level == 'level_none':
+        #     profiler_level = torch_npu.profiler.ProfilerLevel.Level_none
+        # elif args.profile_level == 'level0':
+        #     profiler_level = torch_npu.profiler.ProfilerLevel.Level0
+        # elif args.profile_level == 'level1':
+        profiler_level = torch_npu.profiler.ProfilerLevel.Level1
+        # elif args.profile_level == 'level2':
+        #     profiler_level = torch_npu.profiler.ProfilerLevel.Level2
+        # else:
+        #     raise ValueError(f"profiler_level only supports level0,"
+        #                      f" 1, 2, and level_none, but gets {args.profile_level}")
+        
+        # if args.profile_export_type == 'text':
+        profile_export_type = torch_npu.profiler.ExportType.Text
+        # elif args.profile_export_type == 'db':
+        #     profile_export_type = torch_npu.profiler.ExportType.Db
+        # else:
+        #     raise ValueError(f"profile_export_type only supports text or db,"
+        #                      f"but gets {args.export_type}")
+            
+        experimental_config = torch_npu.profiler._ExperimentalConfig(
+            aic_metrics=torch_npu.profiler.AiCMetrics.PipeUtilization,
+            profiler_level=profiler_level,
+            export_type=profile_export_type,
+            data_simplification=False,
+        )
+
+        activites = [torch_npu.profiler.ProfilerActivity.NPU]
+        activites.append(torch_npu.profiler.ProfilerActivity.CPU)
+
+        prof = torch_npu.profiler.profile(
+            with_stack=False,
+            record_shapes=True,
+            profile_memory=False,
+            activities=activites,
+            schedule=torch_npu.profiler.schedule(wait=0, warmup=1, active=5, repeat=1, skip_first=0),
+            on_trace_ready=torch_npu.profiler.tensorboard_trace_handler("./profiler_output"),
+            experimental_config=experimental_config)
+
+        return prof
+
+
 
     def fit(self):
+        logger.info(f"enter fit !!!!")
         rank = self.device_mesh.get_rank()
 
         # TODO: add a unified tracking
@@ -503,6 +640,7 @@ class FSDPSFTTrainer:
                 experiment_name=self.config.trainer.experiment_name,
                 default_backend=self.config.trainer.logger,
             )
+            logger.info(f"🏃 训练开始 | 实验: {self.config.trainer.experiment_name} | Backend: {self.config.trainer.logger}")
 
         global_step = 0
         # compute the total training steps.
@@ -513,69 +651,144 @@ class FSDPSFTTrainer:
             total_training_steps = self.config.trainer.total_training_steps
 
         self.total_training_steps = total_training_steps
-        print(f"Total training steps: {self.total_training_steps}")
+        
+        if rank == 0:
+            logger.info(f"🎯 训练目标: {self.total_training_steps} steps ({self.config.trainer.total_epochs} epochs)")
+            
+            # NPU预热（避免冷启动影响计时）
+            if get_device_name() == "npu":
+                logger.info("🔥 NPU预热中...")
+                dummy_tensor = torch.randn(2, 2).to(get_device_id())
+                for _ in range(3):
+                    dummy_tensor = dummy_tensor * 2
+                    torch.npu.synchronize()
+                logger.info("✅ NPU预热完成")
 
         # TODO (zhangchi.usc1992) add back checkpoint manager.
         # Currently, it blocks when uploading to hdfs. So very slow.
 
+        prof = self.get_profiler()
+        prof.start()
+
         for epoch in range(self.config.trainer.total_epochs):
             self.train_sampler.set_epoch(epoch=epoch)
+            if rank == 0:
+                logger.info(f"🔄 Epoch {epoch + 1}/{self.config.trainer.total_epochs} 开始")
+
             for data in tqdm(
                 self.train_dataloader,
                 total=self.steps_per_epoch,
                 desc=f"Epoch {epoch + 1}/{self.config.trainer.total_epochs}",
+                disable=rank != 0
             ):
                 global_step += 1
+                # data = TensorDict(data, batch_size=self.config.data.train_batch_size).cuda()
                 data = TensorDict(data, batch_size=self.config.data.train_batch_size).to(get_device_id())
+                
+                # NPU同步以确保准确计时
+                if get_device_name() == "npu":
+                    torch.npu.synchronize()
+                step_start = time.time()
+                
+                logger.info(f"enter self.training_step !!!")
                 metric = self.training_step(data)
+                
+                # 计算step耗时
+                if get_device_name() == "npu":
+                    torch.npu.synchronize()
+                step_time = time.time() - step_start
+                prof.step()
                 if rank == 0:
                     tracking.log(data=metric, step=global_step)
+                    
+                    # 每50步输出详细进度
+                    if global_step % 50 == 0:
+                        logger.info(f"📈 Step {global_step}/{self.total_training_steps} | "
+                                f"Loss: {metric['train/loss']:.4f} | "
+                                f"LR: {metric['train/lr(1e-3)']:.3f}e-3 | "
+                                f"耗时: {step_time:.3f}s")
 
                 if self.config.trainer.save_freq > 0 and global_step % self.config.trainer.save_freq == 0:
+                    if rank == 0:
+                        logger.info(f"💾 触发检查点保存于 step {global_step}")
                     self.save_checkpoint(step=global_step)
 
                 # for early exit validation
                 if global_step >= self.total_training_steps:
+                    if rank == 0:
+                        logger.info(f"🎯 达到目标步数 {self.total_training_steps}，执行最终验证")
+                        
                     # Perform final validation
                     val_losses = []
+                    if rank == 0:
+                        logger.info("🔍 最终验证开始...")
+                        
                     for val_data in self.val_dataloader:
                         val_data = TensorDict(val_data, batch_size=self.config.data.micro_batch_size_per_gpu).to(get_device_id())
                         val_loss = self.validation_step(val_data)
                         val_losses.append(val_loss)
+                        
                     if rank == 0:
                         avg_val_loss = torch.mean(torch.stack(val_losses))
                         metric = {"val/loss": avg_val_loss.detach().item()}
                         tracking.log(data=metric, step=global_step)
+                        logger.info(f"📊 最终验证完成 | Loss: {avg_val_loss.item():.4f}")
+                        
                     torch.distributed.barrier()
 
                     # Save final checkpoint
+                    if rank == 0:
+                        logger.info("💾 保存最终检查点...")
                     self.save_checkpoint(step=global_step)
+                    
+                    if rank == 0:
+                        logger.info("🏁 训练完成！")
                     return
 
             # validation
+            if rank == 0:
+                logger.info(f"🔍 Epoch {epoch + 1} 验证开始...")
+                
             val_losses = []
             for data in self.val_dataloader:
-                data = TensorDict(data, batch_size=self.config.data.micro_batch_size_per_gpu).to(get_device_id())
+                data = TensorDict(data, batch_size=self.config.data.train_batch_size).to(get_device_id())
+                # data = TensorDict(data, batch_size=self.config.data.micro_batch_size_per_gpu).cuda()
                 val_loss = self.validation_step(data)
                 val_losses.append(val_loss)
+                
             if rank == 0:
                 val_loss = torch.mean(torch.stack(val_losses))
                 metric = {"val/loss": val_loss.detach().item()}
                 tracking.log(data=metric, step=global_step)
+                logger.info(f"📊 Epoch {epoch + 1} 验证完成 | Loss: {val_loss.item():.4f}")
+                
             torch.distributed.barrier()
 
             # save checkpoint
+            if rank == 0:
+                logger.info(f"💾 保存 Epoch {epoch + 1} 检查点...")
             self.save_checkpoint(step=global_step)
+            
+            if rank == 0:
+                logger.info(f"✅ Epoch {epoch + 1}/{self.config.trainer.total_epochs} 完成")
+
+            prof.stop()
+
+        if rank == 0:
+            logger.info("🏁 所有 Epoch 训练结束")
 
 
 @hydra.main(config_path="config", config_name="sft_trainer", version_base=None)
 def main(config):
     local_rank, rank, world_size = initialize_global_process_group()
 
+    # device_mesh = init_device_mesh(device_type="cuda", mesh_shape=(world_size,), mesh_dim_names=("fsdp",))
     device_type = get_device_name()
     device_mesh = init_device_mesh(device_type=device_type, mesh_shape=(world_size,), mesh_dim_names=("fsdp",))
+    
     dp_size = world_size // config.ulysses_sequence_parallel_size
     ulysses_device_mesh = init_device_mesh(
+        # device_type="cuda", mesh_shape=(dp_size, config.ulysses_sequence_parallel_size), mesh_dim_names=("dp", "sp")
         device_type=device_type, mesh_shape=(dp_size, config.ulysses_sequence_parallel_size), mesh_dim_names=("dp", "sp")
     )
     # build tokenizer and datasets first
