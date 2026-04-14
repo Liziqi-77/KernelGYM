@@ -6,7 +6,7 @@
 # export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
 
 HDFS_LOG_PATH=""  # you need to set your own log path
-HDFS_CHECKPOINT_PATH="/home/l00899543/SFT/30B/checkpoints"  # you need to set your own checkpoint path
+HDFS_CHECKPOINT_PATH="/home/l00899543/SFT/30B/AscendCsft/"  # you need to set your own checkpoint path
 HDFS_MODEL_PATH="/mnt/weight/"  # you need to set your own model path
 
 # Default values
@@ -21,21 +21,22 @@ DATASET_NAME=""
 TRAIN_FILE_NAME=train_2000
 VAL_FILE_NAME=train_2000
 
-RUN_NAME=drkernel-8b-coldstart
+RUN_NAME=Qwen3-Coder-30B-A3B-Instruct-coldstart
 PROJECT_NAME=kernel-sft
 PROMPT_KEY=prompt
 RESPONSE_KEY=response
 TRUNCATION=right
 LEARNING_RATE=2e-5
 SP_SIZE=4
+ARNOLD_WORKER_GPU=16
 TRAIN_DATA_PATH=${DATASET_NAME} # you need to set your own training data path
 NNODES=$ARNOLD_WORKER_NUM
 GPUS_PER_NODE=$ARNOLD_WORKER_GPU
 if [ -z "$ARNOLD_WORKER_GPU" ]; then
-    GPUS_PER_NODE=8
+    GPUS_PER_NODE=16
 fi
 
-export GPUS_PER_NODE="${GPUS_PER_NODE:-${ARNOLD_WORKER_GPU:-8}}"
+export GPUS_PER_NODE="${GPUS_PER_NODE:-${ARNOLD_WORKER_GPU:-16}}"
 export NNODES="${NNODES:-${ARNOLD_WORKER_NUM:-1}}"
 export NODE_RANK="${NODE_RANK:-${ARNOLD_ID:-0}}"
 export MASTER_ADDR="${MASTER_ADDR:-${ARNOLD_WORKER_0_HOST:-127.0.0.1}}"
@@ -189,6 +190,13 @@ echo "SP Size: $SP_SIZE" | tee -a $LOG_FILE_PATH
 echo "Number of Nodes: $NNODES" | tee -a $LOG_FILE_PATH
 echo "GPUs per Node: $GPUS_PER_NODE" | tee -a $LOG_FILE_PATH
 echo "Train Data Path: $TRAIN_DATA_PATH" | tee -a $LOG_FILE_PATH
+echo "=== Data Path Verification ===" | tee -a $LOG_FILE_PATH
+echo "DATASET_NAME: $DATASET_NAME" | tee -a $LOG_FILE_PATH
+echo "TRAIN_FILE_NAME: $TRAIN_FILE_NAME" | tee -a $LOG_FILE_PATH
+echo "TRAIN_DATA_PATH: $TRAIN_DATA_PATH" | tee -a $LOG_FILE_PATH
+echo "HDFS_DATA_PATH: $HDFS_DATA_PATH" | tee -a $LOG_FILE_PATH
+echo "ACTUAL_DATA_PATH: $ACTUAL_DATA_PATH" | tee -a $LOG_FILE_PATH
+
 sleep 3
 
 torchrun --nproc-per-node $GPUS_PER_NODE \

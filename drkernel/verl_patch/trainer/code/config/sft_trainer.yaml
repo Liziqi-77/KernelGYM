@@ -5,8 +5,8 @@ data:
   train_files: ~/data/gsm8k/train.parquet
   val_files: ~/data/gsm8k/test.parquet
   # Single-turn settings
-  prompt_key: question
-  response_key: answer
+  prompt_key: prompt
+  response_key: response
   prompt_dict_keys: null
   response_dict_keys: null
   # Multi-turn settings
@@ -33,6 +33,7 @@ model:
       min_num_params: 0
     cpu_offload: False
     offload_params: False
+    forward_prefetch: True
   external_lib: null
   enable_gradient_checkpointing: True
   trust_remote_code: False

@@ -1,26 +1,7 @@
-# Copyright 2024 Bytedance Ltd. and/or its affiliates
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-"""
-SFT dataset
-- We assume user pass a single parquet file.
-- We load all the data into the memory.
-Each parquet file contains
-"""
-
 import os
+import json
+import glob
 from typing import List, Union
-
 import pandas as pd
 import torch
 from torch.utils.data import Dataset
@@ -31,13 +12,6 @@ from verl.utils.model import compute_position_id_with_mask
 
 
 class SFTDataset(Dataset):
-    """
-    This is an in-memory SFTDataset
-
-    Arguments:
-        config (OmegaConf): the data config
-    """
-
     def __init__(self, parquet_files: Union[str, List[str]], tokenizer, config):
         prompt_key = config.get("prompt_key", "prompt")
         prompt_dict_keys = config.get("prompt_dict_keys", None)
@@ -49,13 +23,23 @@ class SFTDataset(Dataset):
         assert truncation in ["error", "left", "right"]
         self.truncation = truncation
 
+        # 格式检测逻辑
         self.use_hf_load = False
-        if os.path.isdir(parquet_files):
-            self.use_hf_load = True
-        elif not isinstance(parquet_files, List):
+        self.use_json_load = False
+        
+        if isinstance(parquet_files, str) and os.path.isdir(parquet_files):
+            files = os.listdir(parquet_files)
+            has_json = any(f.endswith('.json') for f in files)
+            
+            if has_json:
+                self.use_json_load = True
+                self.parquet_files = parquet_files
+            else:
+                self.use_hf_load = True
+        elif not isinstance(parquet_files, list):
             parquet_files = [parquet_files]
+            self.parquet_files = parquet_files
 
-        self.parquet_files = parquet_files
         if isinstance(tokenizer, str):
             tokenizer = hf_tokenizer(tokenizer)
         self.tokenizer: PreTrainedTokenizer = tokenizer
@@ -67,26 +51,69 @@ class SFTDataset(Dataset):
 
         self.max_length = max_length
 
-        if not self.use_hf_load:
+        if not self.use_hf_load and not self.use_json_load:
             self._download()
+            
         self._read_files_and_tokenize()
+        self._log_response_stats(num_samples=min(1000, len(self)))
+
+    def _load_json_files(self):
+        """加载 JSON 文件夹格式的数据 - 简化版：只取 input 和 output"""
+        import glob
+        
+        if isinstance(self.parquet_files, str) and os.path.isdir(self.parquet_files):
+            json_pattern = os.path.join(self.parquet_files, "*.json")
+            json_files = sorted(glob.glob(json_pattern))
+        else:
+            json_files = self.parquet_files if isinstance(self.parquet_files, list) else [self.parquet_files]
+            json_files = [f for f in json_files if f.endswith('.json')]
+        
+        all_prompts = []
+        all_responses = []
+        skipped = 0
+        
+        for file_path in json_files:
+            if not os.path.exists(file_path):
+                continue
+                
+            with open(file_path, 'r', encoding='utf-8') as f:
+                try:
+                    data = json.load(f)
+                    if not isinstance(data, list):
+                        continue
+                except json.JSONDecodeError:
+                    continue
+            
+            for item in data:
+                if not isinstance(item, dict):
+                    skipped += 1
+                    continue
+                
+                # 只取 input 作为 prompt，output 作为 response
+                input_text = str(item.get("input", "")).strip()
+                output_text = str(item.get("output", "")).strip()
+                
+                if not input_text or not output_text:
+                    skipped += 1
+                    continue
+                
+                all_prompts.append(input_text)
+                all_responses.append(output_text)
+        
+        self.prompts = all_prompts
+        self.responses = all_responses
+        
+        if os.environ.get("RANK", "0") == "0":
+            print(f"[SFTDataset] Loaded {len(self.prompts)} samples from {len(json_files)} JSON files "
+                  f"(skipped {skipped} invalid items)")
 
     def _download(self):
         for i, parquet_file in enumerate(self.parquet_files):
             self.parquet_files[i] = copy_to_local(parquet_file, verbose=True)
 
     def _read_files_and_tokenize(self):
-        def series_to_item(ls):
-            import numpy
-            import pandas
-
-            while isinstance(ls, (pandas.core.series.Series, numpy.ndarray)) and len(ls) == 1:
-                ls = ls[0]
-            return ls
-
         if self.use_hf_load:
             from datasets import load_dataset
-
             ds = load_dataset(self.parquet_files)
 
             def get_pair(example):
@@ -100,52 +127,76 @@ class SFTDataset(Dataset):
             train_pairs = ds["train"].map(get_pair, remove_columns=ds["train"].column_names, num_proc=4)
             self.prompts = train_pairs["prompt"]
             self.responses = train_pairs["response"]
+            
+        elif self.use_json_load:
+            self._load_json_files()
+            
         else:
+            # 原有 Parquet 处理逻辑保持不变
+            def series_to_item(ls):
+                import numpy
+                import pandas
+                while isinstance(ls, (pandas.core.series.Series, numpy.ndarray)) and len(ls) == 1:
+                    if isinstance(ls, pandas.core.series.Series):
+                        ls = ls.iloc[0]
+                    else:
+                        ls = ls[0]
+                if not isinstance(ls, (pandas.core.series.Series, numpy.ndarray, list)):
+                    return ls
+                if isinstance(ls, list) and len(ls) == 1:
+                    return series_to_item(ls[0])
+                return ls
+
             dataframes = []
             for parquet_file in self.parquet_files:
-                # read parquet files and cache
                 dataframe = pd.read_parquet(parquet_file)
                 dataframes.append(dataframe)
             self.dataframe = pd.concat(dataframes)
+            
             self.prompts = self.dataframe[self.prompt_key]
             if len(self.prompt_dict_keys) > 0:
                 for key in self.prompt_dict_keys:
-                    # type(x): pandas.core.series.Series
-                    # type(x[0]): numpy.ndarray
-                    # type(x[0][0]): dict
                     try:
                         if isinstance(self.prompts, pd.Series):
                             self.prompts = self.prompts.apply(lambda x: series_to_item(x)[key])
-                        else:  # DataFrame
+                        else:
                             self.prompts = self.prompts.apply(lambda row: series_to_item(row)[key], axis=1)
                     except Exception:
                         print(f"self.prompts={self.prompts}")
                         raise
             else:
                 try:
-                    self.prompts = self.prompts.apply(lambda x: series_to_item(x), axis=1)  # noqa: B023
+                    self.prompts = self.prompts.apply(lambda x: series_to_item(x), axis=1)
                 except Exception:
                     print(f"self.prompts={self.prompts}")
                     raise
             self.prompts = self.prompts.tolist()
+            
             self.responses = self.dataframe[self.response_key]
             if len(self.response_dict_keys) > 0:
                 for key in self.response_dict_keys:
                     try:
                         if isinstance(self.responses, pd.Series):
                             self.responses = self.responses.apply(lambda x: series_to_item(x)[key])
-                        else:  # DataFrame
+                        else:
                             self.responses = self.responses.apply(lambda row: series_to_item(row)[key], axis=1)
                     except Exception:
                         print(f"self.responses={self.responses}")
                         raise
             else:
                 try:
-                    self.responses = self.responses.apply(lambda x: series_to_item(x), axis=1)  # noqa: B023
+                    self.responses = self.responses.apply(lambda x: series_to_item(x), axis=1)
                 except Exception:
                     print(f"self.responses={self.responses}")
                     raise
             self.responses = self.responses.tolist()
+
+        if os.environ.get("RANK", "0") == "0":
+            response_lens = [len(str(r)) for r in self.responses[:1000]]
+            if response_lens:
+                avg_chars = sum(response_lens) / len(response_lens)
+                print(f"[SFTDataset] Sampled response length (chars): avg={avg_chars:.0f}, "
+                      f"max={max(response_lens)}, min={min(response_lens)}")
 
     def __len__(self):
         return len(self.prompts)
@@ -156,14 +207,11 @@ class SFTDataset(Dataset):
         prompt = self.prompts[item]
         response = self.responses[item]
 
-        # apply chat template
+        # 构造单轮对话（input -> output）
         prompt_chat = [{"role": "user", "content": prompt}]
-
-        # string
         prompt_chat_str = tokenizer.apply_chat_template(prompt_chat, add_generation_prompt=True, tokenize=False)
         response_chat_str = response + tokenizer.eos_token
 
-        # tokenize
         prompt_ids_output = tokenizer(prompt_chat_str, return_tensors="pt", add_special_tokens=False)
         prompt_ids = prompt_ids_output["input_ids"][0]
         prompt_attention_mask = prompt_ids_output["attention_mask"][0]
@@ -178,7 +226,6 @@ class SFTDataset(Dataset):
         input_ids = torch.cat((prompt_ids, response_ids), dim=-1)
         attention_mask = torch.cat((prompt_attention_mask, response_attention_mask), dim=-1)
 
-        # padding to max length
         sequence_length = input_ids.shape[0]
         if sequence_length < self.max_length:
             padded_input_ids = (
@@ -191,7 +238,6 @@ class SFTDataset(Dataset):
             attention_mask = torch.cat((attention_mask, padded_attention_mask))
         elif sequence_length > self.max_length:
             if self.truncation == "left":
-                # actually, left truncation may not be reasonable
                 input_ids = input_ids[-self.max_length :]
                 attention_mask = attention_mask[-self.max_length :]
             elif self.truncation == "right":
@@ -206,10 +252,12 @@ class SFTDataset(Dataset):
 
         loss_mask = attention_mask.clone()
         if prompt_length > 1:
-            # mask out prompt for SFT.
             loss_mask[: min(prompt_length, loss_mask.size(0)) - 1] = 0
-        # mask out the last token in response
         loss_mask[min(prompt_length + response_length, loss_mask.size(0)) - 1] = 0
+
+        if item < 5 and os.environ.get("RANK", "0") == "0":
+            print(f"[SFTDataset] Sample {item}: prompt_tokens={prompt_length}, "
+                  f"response_tokens={response_length}, total={input_ids.shape[0]}")
 
         return {
             "input_ids": input_ids,
@@ -217,3 +265,33 @@ class SFTDataset(Dataset):
             "position_ids": position_ids,
             "loss_mask": loss_mask,
         }
+    
+    def _log_response_stats(self, num_samples=100):
+        """统计 response 的 token 数量分布"""
+        import numpy as np
+        import os
+        
+        if os.environ.get("RANK", "0") != "0":
+            return
+        
+        indices = np.random.choice(len(self), min(num_samples, len(self)), replace=False)
+        lengths = []
+        
+        for idx in indices:
+            response = self.responses[idx]
+            response_chat_str = response + self.tokenizer.eos_token
+            response_ids = self.tokenizer(response_chat_str, return_tensors="pt", add_special_tokens=False)["input_ids"][0]
+            lengths.append(response_ids.shape[0])
+        
+        if lengths:
+            lengths = np.array(lengths)
+            print(f"\n{'='*60}")
+            print(f"[SFTDataset] Response Token Statistics (sampled {len(lengths)}/{len(self)} items):")
+            print(f"  Mean:   {lengths.mean():.1f}")
+            print(f"  Median: {np.median(lengths):.1f}")
+            print(f"  Min:    {lengths.min()}")
+            print(f"  Max:    {lengths.max()}")
+            print(f"  P90:    {np.percentile(lengths, 90):.1f}")
+            print(f"  P95:    {np.percentile(lengths, 95):.1f}")
+            print(f"  P99:    {np.percentile(lengths, 99):.1f}")
+            print(f"{'='*60}\n")
