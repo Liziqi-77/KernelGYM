@@ -233,13 +233,13 @@ class FSDPSFTTrainer:
         )
 
         with init_context():
-            attn_impl = "eager" if is_npu_available else "flash_attention_2"
+            # attn_impl = "eager" if is_npu_available else "flash_attention_2"
             self.model: PreTrainedModel = AutoModelForCausalLM.from_pretrained(
                 local_model_path,
                 config=config,
                 torch_dtype=torch.float32,
-                # attn_implementation="flash_attention_2",
-                attn_implementation=attn_impl,
+                attn_implementation="flash_attention_2",
+                # attn_implementation=attn_impl,
                 trust_remote_code=trust_remote_code,
             )
 
@@ -667,8 +667,8 @@ class FSDPSFTTrainer:
         # TODO (zhangchi.usc1992) add back checkpoint manager.
         # Currently, it blocks when uploading to hdfs. So very slow.
 
-        prof = self.get_profiler()
-        prof.start()
+        # prof = self.get_profiler()
+        # prof.start()
 
         for epoch in range(self.config.trainer.total_epochs):
             self.train_sampler.set_epoch(epoch=epoch)
@@ -697,7 +697,7 @@ class FSDPSFTTrainer:
                 if get_device_name() == "npu":
                     torch.npu.synchronize()
                 step_time = time.time() - step_start
-                prof.step()
+                # prof.step()
                 if rank == 0:
                     tracking.log(data=metric, step=global_step)
                     
@@ -751,7 +751,7 @@ class FSDPSFTTrainer:
                 
             val_losses = []
             for data in self.val_dataloader:
-                data = TensorDict(data, batch_size=self.config.data.train_batch_size).to(get_device_id())
+                data = TensorDict(data, batch_size=self.config.data.micro_batch_size_per_gpu).to(get_device_id())
                 # data = TensorDict(data, batch_size=self.config.data.micro_batch_size_per_gpu).cuda()
                 val_loss = self.validation_step(data)
                 val_losses.append(val_loss)
@@ -772,7 +772,7 @@ class FSDPSFTTrainer:
             if rank == 0:
                 logger.info(f"✅ Epoch {epoch + 1}/{self.config.trainer.total_epochs} 完成")
 
-            prof.stop()
+            # prof.stop()
 
         if rank == 0:
             logger.info("🏁 所有 Epoch 训练结束")
